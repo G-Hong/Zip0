@@ -1,8 +1,13 @@
 import glob
 import time
 import json
+import numpy as np
 import os
 import cv2
+import sys
+import select
+from threading import Thread
+from flask import Flask, Response
 from lerobot.robots.so_follower import SOFollower
 from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 from lerobot.teleoperators.so_leader import SOLeader
@@ -66,14 +71,86 @@ class SO101(NexodimRobot):
 
     # ── 메인 함수 ──
 
+    def _load_saved_ports(self):
+        port_file = os.path.join(os.path.dirname(__file__), "configs", "ports.json")
+        if os.path.exists(port_file):
+            with open(port_file, "r") as f:
+                return json.load(f)
+        return {}
+
+    def _save_ports(self):
+        port_file = os.path.join(os.path.dirname(__file__), "configs", "ports.json")
+        ports = {}
+        if self.robot_port:
+            ports["follower"] = self.robot_port
+        if self.leader_port:
+            ports["leader"] = self.leader_port
+        if self.camera_index is not None:
+            ports["camera"] = self.camera_index
+        with open(port_file, "w") as f:
+            json.dump(ports, f, indent=2)
+
     def connect(self, mode="auto", use_camera=True):
-        self._connect_follower(calibrate=False)
+        saved = self._load_saved_ports()
 
+        # 팔로워 연결
+        if not self.robot_port:
+            if "follower" in saved:
+                self.robot_port = saved["follower"]
+                print(f"[{self.id}] 저장된 포트 사용: {self.robot_port}")
+            else:
+                self.robot_port = self._find_port("Follower Arm")
+
+        try:
+            self._connect_follower(calibrate=False)
+        except Exception:
+            print(f"[{self.id}] 저장된 포트 실패. 다시 찾기...")
+            self.robot_port = self._find_port("Follower Arm")
+            self._connect_follower(calibrate=False)
+
+        # 리더 연결
         if mode == "teach":
-            self._connect_leader(calibrate=False)
+            if not self.leader_port:
+                if "leader" in saved:
+                    self.leader_port = saved["leader"]
+                    print(f"[{self.id}] 저장된 포트 사용: {self.leader_port}")
+                else:
+                    self.leader_port = self._find_port("Leader Arm")
 
+            try:
+                self._connect_leader(calibrate=False)
+            except Exception:
+                print(f"[{self.id}] 저장된 포트 실패. 다시 찾기...")
+                self.leader_port = self._find_port("Leader Arm")
+                self._connect_leader(calibrate=False)
+
+        # 카메라
         if use_camera:
+            if self.camera_index is None and "camera" in saved:
+                self.camera_index = saved["camera"]
+                print(f"[{self.id}] 저장된 카메라 사용: {self.camera_index}")
             self.connect_camera()
+
+            # 연결 실패하면 다시 찾기
+            if self.camera is None:
+                print(f"[{self.id}] 저장된 카메라 실패. 다시 찾기...")
+                self.camera_index = self._find_camera()
+                self.connect_camera()
+
+        # 포트 저장
+        self._save_ports()
+
+        print(f"[{self.id}] SO101 연결 완료! (mode={mode})")
+
+
+    # def connect(self, mode="auto", use_camera=True):
+    #     self._connect_follower(calibrate=False)
+
+    #     if mode == "teach":
+    #         self._connect_leader(calibrate=False)
+
+    #     if use_camera:
+    #         self.connect_camera()
 
         print(f"[{self.id}] SO101 연결 완료! (mode={mode})")
 
@@ -87,7 +164,13 @@ class SO101(NexodimRobot):
             self.camera.release()
         self.camera = cv2.VideoCapture(self.camera_index)
         if self.camera.isOpened():
-            print(f"[{self.id}] 카메라 연결 완료!")
+            ret, frame = self.camera.read()
+            if ret:
+                preview_path = os.path.join(os.path.expanduser("~"), "projects", "camera_preview.jpg")
+                cv2.imwrite(preview_path, frame)
+                print(f"[{self.id}] 카메라 연결 완료! 미리보기: {preview_path}")
+            else:
+                print(f"[{self.id}] 카메라 연결 완료!")
         else:
             print(f"[{self.id}] 카메라 연결 실패.")
             self.camera = None
@@ -169,11 +252,132 @@ class SO101(NexodimRobot):
         except KeyboardInterrupt:
             print(f"[{self.id}] 텔레옵 종료")
 
+    def _start_preview_server(self):
+        """백그라운드에서 카메라 미리보기 웹서버 실행"""
+        app = Flask(__name__)
+        robot = self
+
+        @app.route('/')
+        def index():
+            return '<html><body><h2>NxD Camera Preview</h2><img src="/feed" width="640"></body></html>'
+
+        @app.route('/feed')
+        def feed():
+            def generate():
+                while True:
+                    if robot.camera:
+                        ret, frame = robot.camera.read()
+                        if ret:
+                            _, jpeg = cv2.imencode('.jpg', frame)
+                            yield (b'--frame\r\n'
+                                b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+                    time.sleep(1/30)
+            return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+
+    def record(self, task="default_task", episodes=3, fps=30, save_dir=None):
+        if self.leader is None:
+            print("녹화하려면 connect(mode='teach') 로 연결해야 해요!")
+            return
+        if self.camera is None:
+            print("카메라가 연결되어 있지 않아요! connect(use_camera=True) 확인해주세요.")
+            return
+
+        if save_dir is None:
+            save_dir = os.path.join(os.path.expanduser("~"), "projects", "data", task)
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 기존 에피소드 이어서
+        existing = glob.glob(os.path.join(save_dir, "episode_*"))
+        start_ep = len(existing)
+        if start_ep > 0:
+            print(f"[{self.id}] 기존 {start_ep}개 에피소드 있음. 이어서 녹화!")
+
+        metadata = {"task": task, "episodes": start_ep + episodes, "fps": fps}
+        with open(os.path.join(save_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        # 카메라 미리보기 서버 시작
+        if self.camera:
+            server = Thread(target=self._start_preview_server, daemon=True)
+            server.start()
+            print(f"[{self.id}] 카메라 미리보기: http://localhost:5000")
+
+        for ep in range(start_ep, start_ep + episodes):
+            ep_dir = os.path.join(save_dir, f"episode_{ep}")
+            os.makedirs(ep_dir, exist_ok=True)
+
+            joint_data = []
+            video_writer = None
+            recording = False
+
+            if self.camera:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(
+                    os.path.join(ep_dir, "video.mp4"),
+                    fourcc, fps, (640, 480)
+                )
+
+            print(f"\n[{self.id}] 에피소드 {ep+1}/{start_ep + episodes}")
+            print(f"[{self.id}] 텔레옵 작동 중... 위치 잡으세요")
+            print(f"[{self.id}] 엔터: 녹화 시작/종료")
+
+            # 녹화 대기 (텔레옵 유지)
+            import select
+            while True:
+                action = self.leader.get_action()
+                self.robot.send_action(action)
+                time.sleep(1/fps)
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    sys.stdin.readline()
+                    break
+
+            print(f"[{self.id}] 녹화 시작!")
+            recording = True
+
+            # 녹화 중 (텔레옵 + 저장)
+            while recording:
+                action = self.leader.get_action()
+                self.robot.send_action(action)
+
+                obs = self.robot.get_observation()
+                joint_data.append(obs)
+
+                if self.camera and video_writer:
+                    ret, frame = self.camera.read()
+                    if ret:
+                        video_writer.write(frame)
+
+                time.sleep(1/fps)
+
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    sys.stdin.readline()
+                    recording = False
+
+            if video_writer:
+                video_writer.release()
+            np.save(os.path.join(ep_dir, "joints.npy"), joint_data)
+            print(f"[{self.id}] 에피소드 {ep+1} 저장 완료! ({len(joint_data)} 프레임)")
+
+        print(f"\n[{self.id}] 녹화 완료! {save_dir}")
+
+        # 추가 녹화 여부
+        choice = input(f"\n[{self.id}] 다른 작업 녹화? (y/n): ").strip().lower()
+        if choice == "y":
+            new_task = input(f"[{self.id}] 작업 이름: ").strip()
+            ep_count = input(f"[{self.id}] 에피소드 수 (기본 3): ").strip()
+            ep_count = int(ep_count) if ep_count else 3
+            self.record(task=new_task, episodes=ep_count, fps=fps)
+
     # ── 해제 ──
 
     def disconnect_leader(self):
         if self.leader:
-            self.leader.disconnect()
+            try:
+                self.leader.disconnect()
+            except Exception as e:
+                print(f"[{self.id}] Leader 해제 중 경고: {e}")
             self.leader = None
             print(f"[{self.id}] Leader Arm 해제 완료")
 
@@ -185,7 +389,10 @@ class SO101(NexodimRobot):
 
     def disconnect(self):
         if self.robot:
-            self.robot.disconnect()
+            try:
+                self.robot.disconnect()
+            except Exception as e:
+                print(f"[{self.id}] Main Robot 해제 중 경고: {e}")
             print(f"[{self.id}] Main Robot 해제 완료")
         self.disconnect_leader()
         self.disconnect_camera()
