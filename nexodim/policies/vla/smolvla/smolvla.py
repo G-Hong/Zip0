@@ -416,9 +416,6 @@ class SmolVLA(NexodimPolicies):
         Returns:
             dict: 로봇에 보낼 액션 (send_action에 직접 전달 가능)
         """
-        from lerobot.policies.utils import build_inference_frame, make_robot_action
-        from lerobot.datasets.feature_utils import hw_to_dataset_features
-
         if self.model is None:
             raise RuntimeError(
                 "모델이 로드되지 않았습니다. load_policy()를 먼저 호출하세요."
@@ -429,21 +426,8 @@ class SmolVLA(NexodimPolicies):
 
         self.model.eval()
 
-        # NexodimRobot의 관측을 LeRobot 형식으로 변환
-        obs = self._convert_observation(observation)
-
-        # dataset_features가 없으면 모델의 config에서 추출
-        if self.dataset_features is None:
-            self.dataset_features = self._build_dataset_features_from_config()
-
-        # 추론 프레임 구성
-        obs_frame = build_inference_frame(
-            observation=obs,
-            ds_features=self.dataset_features,
-            device=self.device,
-            task=task,
-            robot_type=robot_type,
-        )
+        # NexodimRobot의 raw observation을 모델 입력 형식으로 직접 변환
+        obs_frame = self._build_obs_frame(observation, task, robot_type)
 
         # 전처리 → 추론 → 후처리
         obs_frame = self.preprocessor(obs_frame)
@@ -452,9 +436,11 @@ class SmolVLA(NexodimPolicies):
             action = self.model.select_action(obs_frame)
 
         action = self.postprocessor(action)
-        action = make_robot_action(action, self.dataset_features)
 
-        return action
+        # 액션 텐서를 로봇이 받을 수 있는 dict로 변환
+        action_dict = self._action_to_robot_dict(action)
+
+        return action_dict
 
     def run_inference_loop(
         self,
@@ -590,87 +576,131 @@ class SmolVLA(NexodimPolicies):
 
         return delta_timestamps
 
-    def _convert_observation(self, obs):
+    def _build_obs_frame(self, observation, task, robot_type):
         """
-        NexodimRobot.get_observation() 형식을 LeRobot 추론 형식으로 변환합니다.
+        NexodimRobot.get_observation()의 raw 출력을 모델이 직접 소비할 수 있는
+        형태로 변환합니다. build_inference_frame 없이 직접 구성합니다.
 
-        SO101의 get_observation()은 다음과 같은 형태를 반환:
-          - "shoulder_pan.pos", "shoulder_lift.pos", ... 등 관절 값
-          - "camera" → numpy 이미지 (H, W, 3) BGR
+        SO101 get_observation() 반환 형태:
+          shoulder_pan.pos: float, shoulder_lift.pos: float, ...
+          camera: ndarray (480, 640, 3) BGR
 
-        이를 LeRobot이 기대하는 형식으로 변환:
-          - "observation.state" → tensor
-          - "observation.images.front" → tensor (C, H, W) RGB
+        모델이 기대하는 형태:
+          observation.state: tensor [1, 6]
+          observation.images.front: tensor [1, 3, H, W] (0~1 RGB)
+          task: str
         """
         import cv2
 
-        converted = {}
+        frame = {}
 
-        # 관절 상태 수집
+        # ── 1. 관절 상태 → observation.state ──
         joint_names = [
             "shoulder_pan", "shoulder_lift", "elbow_flex",
             "wrist_flex", "wrist_roll", "gripper",
         ]
-        state_values = []
 
-        # 이미 observation.state 형태로 들어오는 경우
-        if "observation.state" in obs:
-            converted["observation.state"] = obs["observation.state"]
+        if "observation.state" in observation:
+            state = observation["observation.state"]
+            if not isinstance(state, torch.Tensor):
+                state = torch.tensor(state, dtype=torch.float32)
+            frame["observation.state"] = state.unsqueeze(0).to(self.device)
         else:
-            # NexodimRobot 형식의 개별 관절 값들을 모아서 state 벡터 생성
+            state_values = []
             for name in joint_names:
-                key_pos = f"{name}.pos"
-                if key_pos in obs:
-                    val = obs[key_pos]
-                    if isinstance(val, torch.Tensor):
-                        state_values.append(val.item() if val.dim() == 0 else val)
-                    else:
-                        state_values.append(float(val))
-
+                key = f"{name}.pos"
+                if key in observation:
+                    state_values.append(float(observation[key]))
             if state_values:
-                converted["observation.state"] = torch.tensor(
-                    state_values, dtype=torch.float32
-                )
+                state_tensor = torch.tensor(state_values, dtype=torch.float32)
+                frame["observation.state"] = state_tensor.unsqueeze(0).to(self.device)
 
-        # 카메라 이미지 변환
-        # "camera" 키 → "observation.images.front"
-        if "camera" in obs and obs["camera"] is not None:
-            frame = obs["camera"]
-            if isinstance(frame, np.ndarray):
-                # BGR → RGB 변환
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # (H, W, C) → (C, H, W), 0~255 → 0~1 float
-                frame_tensor = (
-                    torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
-                )
-                converted["observation.images.front"] = frame_tensor
-            elif isinstance(frame, torch.Tensor):
-                converted["observation.images.front"] = frame
+        # ── 2. 카메라 이미지 → observation.images.XXX ──
+        # 모델 config에서 기대하는 이미지 키 이름을 가져옴
+        image_keys = list(getattr(self.config, "image_features", {}).keys())
+        if not image_keys:
+            image_keys = ["observation.images.front"]
 
-        # 이미 LeRobot 형식의 이미지 키가 있으면 그대로 전달
-        for key, val in obs.items():
+        if "camera" in observation and observation["camera"] is not None:
+            img = observation["camera"]
+            if isinstance(img, np.ndarray):
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img_tensor = (
+                    torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+                )
+            elif isinstance(img, torch.Tensor):
+                img_tensor = img
+            else:
+                img_tensor = None
+
+            if img_tensor is not None:
+                # 첫 번째 이미지 키에 할당 (카메라가 1개인 경우)
+                frame[image_keys[0]] = img_tensor.unsqueeze(0).to(self.device)
+
+        # 이미 observation.images. 형태로 들어온 키 처리
+        for key, val in observation.items():
             if key.startswith("observation.images."):
-                converted[key] = val
+                if isinstance(val, torch.Tensor):
+                    if val.dim() == 3:
+                        val = val.unsqueeze(0)
+                    frame[key] = val.to(self.device)
+                elif isinstance(val, np.ndarray):
+                    img_rgb = cv2.cvtColor(val, cv2.COLOR_BGR2RGB)
+                    t = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+                    frame[key] = t.unsqueeze(0).to(self.device)
 
-        # 나머지 observation. 키도 전달
-        for key, val in obs.items():
-            if key.startswith("observation.") and key not in converted:
-                converted[key] = val
+        # ── 3. task & robot_type ──
+        if task:
+            frame["task"] = task
+        if robot_type:
+            frame["robot_type"] = robot_type
 
-        return converted
+        return frame
+
+    def _action_to_robot_dict(self, action):
+        """
+        모델 출력 액션 텐서를 NexodimRobot.send_action()이 받을 수 있는
+        dict 형태로 변환합니다.
+
+        action: tensor [action_dim] 또는 [1, action_dim] 또는 dict
+        반환: SO101이 받을 수 있는 형태 (dict 또는 tensor)
+        """
+        # 이미 dict이면 그대로 반환
+        if isinstance(action, dict):
+            return action
+
+        # tensor인 경우 배치 차원 제거
+        if isinstance(action, torch.Tensor):
+            if action.dim() > 1:
+                action = action.squeeze(0)
+            action = action.cpu()
+
+            # SO101의 관절 이름에 매핑
+            joint_names = [
+                "shoulder_pan", "shoulder_lift", "elbow_flex",
+                "wrist_flex", "wrist_roll", "gripper",
+            ]
+
+            # 액션 차원이 관절 수와 같으면 dict로 변환
+            if action.shape[0] == len(joint_names):
+                return {
+                    f"{name}.pos": action[i].item()
+                    for i, name in enumerate(joint_names)
+                }
+
+            # 차원이 다르면 텐서 그대로 반환 (send_action이 텐서도 받을 수 있음)
+            return action
+
+        return action
 
     def _build_dataset_features_from_config(self):
         """모델 config에서 dataset_features를 구성합니다."""
-        from lerobot.configs.types import FeatureType, PolicyFeature
-
         features = {}
 
-        # input_features
         input_features = getattr(self.config, "input_features", {})
         for key, feat in input_features.items():
             features[key] = feat
 
-        # output_features
         output_features = getattr(self.config, "output_features", {})
         for key, feat in output_features.items():
             features[key] = feat
