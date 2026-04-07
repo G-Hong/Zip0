@@ -33,12 +33,28 @@ def step1_set_home():
     print("=" * 50)
     print("  리더 암으로 팔로워를 안전한 시작 위치로 옮기세요.")
     print("  이 위치가 매 에피소드의 시작/끝 위치가 됩니다.")
-    input("\n  위치를 잡았으면 엔터를 누르세요...")
+    
+    print("\n  위치를 잡았으면 엔터를 누르세요...")
+    import select
+    while True:
+        action = robot.leader.get_action()
+        robot.robot.send_action(action)
+        time.sleep(1/30)
+        if select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+            break
 
     robot.set_home_position()
 
     print("\n  홈 포지션 테스트: 팔을 다른 곳으로 옮긴 뒤 엔터를 누르세요.")
-    input("  엔터를 누르면 홈으로 돌아갑니다...")
+    print("  엔터를 누르면 홈으로 돌아갑니다...")
+    while True:
+        action = robot.leader.get_action()
+        robot.robot.send_action(action)
+        time.sleep(1/30)
+        if select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+            break
 
     robot.go_home(duration=3.0)
 

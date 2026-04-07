@@ -120,6 +120,7 @@ class SmolVLA(NexodimPolicies):
     def train_policy(
         self,
         dataset_repo_id,
+        dataset_root=None,
         steps=20000,
         batch_size=64,
         lr=1e-4,
@@ -136,7 +137,13 @@ class SmolVLA(NexodimPolicies):
         SmolVLA 모델을 파인튜닝합니다.
 
         Args:
-            dataset_repo_id: HuggingFace Hub 데이터셋 ID (예: "user/my_dataset")
+            dataset_repo_id: 데이터셋 ID
+                - Hub 데이터셋:  "user/my_dataset"
+                - 로컬 데이터셋: "local/my_dataset" (dataset_root와 함께 사용)
+            dataset_root:    로컬 데이터셋의 루트 경로.
+                             None이면 Hub에서 다운로드.
+                             예) "/home/user/data/my_dataset"
+                                 "~/projects/data/so101/pick_up"
             steps:           총 학습 스텝 수
             batch_size:      배치 크기 (VRAM에 맞게 조절. 6GB→16, 12GB→44, 24GB+→64)
             lr:              학습률
@@ -148,6 +155,16 @@ class SmolVLA(NexodimPolicies):
             num_workers:     DataLoader worker 수
             resume_from:     이어서 학습할 체크포인트 경로
             gradient_clip_max_norm: 그래디언트 클리핑 최대 노름
+
+        사용 예시:
+            # Hub 데이터셋으로 학습
+            policy.train_policy(dataset_repo_id="lerobot/svla_so101_pickplace")
+
+            # 로컬 데이터셋으로 학습
+            policy.train_policy(
+                dataset_repo_id="local/my_dataset",
+                dataset_root="/home/user/data/my_dataset",
+            )
         """
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
@@ -160,14 +177,25 @@ class SmolVLA(NexodimPolicies):
                 "모델이 로드되지 않았습니다. load_policy()를 먼저 호출하세요."
             )
 
+        # dataset_root가 문자열이면 Path로 변환
+        if dataset_root is not None:
+            dataset_root = Path(dataset_root).expanduser().resolve()
+
         if output_dir is None:
             timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
             output_dir = os.path.join("outputs", "train", f"smolvla_{timestamp}")
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[SmolVLA] 데이터셋 로딩: {dataset_repo_id}")
-        self.dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
+        # 데이터셋 메타데이터 로드 (로컬 or Hub)
+        if dataset_root is not None:
+            print(f"[SmolVLA] 로컬 데이터셋 로딩: {dataset_root}")
+            self.dataset_metadata = LeRobotDatasetMetadata(
+                dataset_repo_id, root=dataset_root
+            )
+        else:
+            print(f"[SmolVLA] Hub 데이터셋 로딩: {dataset_repo_id}")
+            self.dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
 
         # 데이터셋 피처를 정책 피처로 변환
         features = dataset_to_policy_features(self.dataset_metadata.features)
@@ -190,8 +218,11 @@ class SmolVLA(NexodimPolicies):
         fps = self.dataset_metadata.fps
         delta_timestamps = self._build_delta_timestamps(fps)
 
-        # 데이터셋 & 데이터로더 생성
-        self.dataset = LeRobotDataset(dataset_repo_id, delta_timestamps=delta_timestamps)
+        # 데이터셋 & 데이터로더 생성 (로컬 or Hub)
+        ds_kwargs = {"delta_timestamps": delta_timestamps}
+        if dataset_root is not None:
+            ds_kwargs["root"] = dataset_root
+        self.dataset = LeRobotDataset(dataset_repo_id, **ds_kwargs)
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=batch_size,
@@ -314,6 +345,7 @@ class SmolVLA(NexodimPolicies):
     def validate_policy(
         self,
         dataset_repo_id=None,
+        dataset_root=None,
         num_batches=50,
         batch_size=32,
     ):
@@ -322,6 +354,7 @@ class SmolVLA(NexodimPolicies):
 
         Args:
             dataset_repo_id: 검증용 데이터셋 (None이면 학습에 사용한 데이터셋 재사용)
+            dataset_root:    로컬 데이터셋 루트 경로 (None이면 Hub)
             num_batches:     검증할 배치 수
             batch_size:      배치 크기
 
@@ -337,12 +370,22 @@ class SmolVLA(NexodimPolicies):
                 "모델이 로드되지 않았습니다. load_policy()를 먼저 호출하세요."
             )
 
+        if dataset_root is not None:
+            dataset_root = Path(dataset_root).expanduser().resolve()
+
         # 데이터셋 준비
         if dataset_repo_id is not None:
-            metadata = LeRobotDatasetMetadata(dataset_repo_id)
+            meta_kwargs = {}
+            if dataset_root is not None:
+                meta_kwargs["root"] = dataset_root
+            metadata = LeRobotDatasetMetadata(dataset_repo_id, **meta_kwargs)
             fps = metadata.fps
             delta_timestamps = self._build_delta_timestamps(fps)
-            val_dataset = LeRobotDataset(dataset_repo_id, delta_timestamps=delta_timestamps)
+
+            ds_kwargs = {"delta_timestamps": delta_timestamps}
+            if dataset_root is not None:
+                ds_kwargs["root"] = dataset_root
+            val_dataset = LeRobotDataset(dataset_repo_id, **ds_kwargs)
 
             preprocessor, _ = make_pre_post_processors(
                 self.config,

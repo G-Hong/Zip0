@@ -138,6 +138,10 @@ class SO101(NexodimRobot):
                 self.camera_index = self._find_camera()
                 self.connect_camera()
 
+        # 설정 및 홈 포지션 불러오기
+        self.setup()
+        self._load_home_position()
+
         # 포트 저장
         self._save_ports()
 
@@ -400,7 +404,12 @@ class SO101(NexodimRobot):
             return
 
         if save_dir is None:
-            save_dir = os.path.join(os.path.expanduser("~"), "projects", "data", "so101", task)
+            # 현재 파일(so101.py)의 위치를 기준으로 3단계 위인 Zip0 루트 폴더를 자동으로 찾습니다.
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            zip0_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+            
+            # Zip0/data/so101/task 경로 설정
+            save_dir = os.path.join(zip0_root, "data", "so101", task)
         os.makedirs(save_dir, exist_ok=True)
 
         # 기존 에피소드 이어서
@@ -418,6 +427,9 @@ class SO101(NexodimRobot):
             server = Thread(target=self._start_preview_server, daemon=True)
             server.start()
             print(f"[{self.id}] 카메라 미리보기: http://localhost:5000")
+
+        import select
+        import termios
 
         for ep in range(start_ep, start_ep + episodes):
             ep_dir = os.path.join(save_dir, f"episode_{ep}")
@@ -438,14 +450,16 @@ class SO101(NexodimRobot):
             print(f"[{self.id}] 텔레옵 작동 중... 위치 잡으세요")
             print(f"[{self.id}] 엔터: 녹화 시작/종료")
 
-            # 녹화 대기 (텔레옵 유지)
-            import select
+            # 녹화 대기 (텔레옵 유지 및 버퍼 비우기)
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
             while True:
                 action = self.leader.get_action()
                 self.robot.send_action(action)
                 time.sleep(1/fps)
                 if select.select([sys.stdin], [], [], 0)[0]:
                     sys.stdin.readline()
+                    time.sleep(0.5)  # 중복 입력 방지
+                    termios.tcflush(sys.stdin, termios.TCIFLUSH)
                     break
 
             print(f"[{self.id}] 녹화 시작!")
@@ -457,7 +471,10 @@ class SO101(NexodimRobot):
                 self.robot.send_action(action)
 
                 obs = self.robot.get_observation()
-                joint_data.append(obs)
+                
+                # 메모리 폭발 방지: 카메라는 영상으로 저장하므로 관절 데이터에서 제외
+                joint_only_obs = {k: v for k, v in obs.items() if k != "camera"}
+                joint_data.append(joint_only_obs)
 
                 if self.camera and video_writer:
                     ret, frame = self.camera.read()
