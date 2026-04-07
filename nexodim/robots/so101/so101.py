@@ -25,6 +25,7 @@ class SO101(NexodimRobot):
         self.camera = None
         self.robot_port = None
         self.leader_port = None
+        self.home_position = None
 
     # ── 내부 유틸 ──
 
@@ -226,6 +227,120 @@ class SO101(NexodimRobot):
         print(f"[{self.id}] 초기 셋업 완료!")
         self.disconnect()
 
+    # ── 홈 포지션 ──
+ 
+    def _home_position_path(self):
+        return os.path.join(os.path.dirname(__file__), "configs", "home_position.json")
+ 
+    def _load_home_position(self):
+        """저장된 홈 포지션을 파일에서 로드합니다."""
+        path = self._home_position_path()
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                self.home_position = json.load(f)
+            print(f"[{self.id}] 저장된 홈 포지션 로드 완료")
+        else:
+            self.home_position = None
+ 
+    def set_home_position(self, position=None):
+        """
+        홈 포지션을 설정합니다.
+ 
+        Args:
+            position: dict – 관절 위치. None이면 현재 위치를 홈으로 저장.
+                예) {"shoulder_pan.pos": 0, "shoulder_lift.pos": -90, ...}
+ 
+        사용법:
+            # 방법 1: 현재 위치를 홈으로 저장
+            robot.set_home_position()
+ 
+            # 방법 2: 직접 값 지정
+            robot.set_home_position({
+                "shoulder_pan.pos": 0.0,
+                "shoulder_lift.pos": -90.0,
+                "elbow_flex.pos": 90.0,
+                "wrist_flex.pos": 0.0,
+                "wrist_roll.pos": 0.0,
+                "gripper.pos": 0.0,
+            })
+        """
+        if position is not None:
+            self.home_position = position
+        else:
+            # 현재 관절 위치를 읽어서 홈으로 저장
+            obs = self.get_observation()
+            joint_names = [
+                "shoulder_pan", "shoulder_lift", "elbow_flex",
+                "wrist_flex", "wrist_roll", "gripper",
+            ]
+            self.home_position = {}
+            for name in joint_names:
+                key = f"{name}.pos"
+                if key in obs:
+                    self.home_position[key] = float(obs[key])
+ 
+        # 파일에 저장
+        path = self._home_position_path()
+        with open(path, "w") as f:
+            json.dump(self.home_position, f, indent=2)
+ 
+        print(f"[{self.id}] 홈 포지션 저장 완료:")
+        for k, v in self.home_position.items():
+            print(f"    {k}: {v:.2f}")
+ 
+    def go_home(self, duration=3.0, fps=60):
+        """
+        홈 포지션으로 부드럽게 이동합니다.
+ 
+        Args:
+            duration: 이동 시간 (초). 클수록 느리고 안전합니다.
+            fps:      보간 주파수
+        """
+        if self.home_position is None:
+            print(f"[{self.id}] 홈 포지션이 설정되지 않았습니다. set_home_position()을 먼저 호출하세요.")
+            return
+ 
+        if self.robot is None:
+            print(f"[{self.id}] 로봇이 연결되지 않았습니다.")
+            return
+ 
+        # 현재 위치 읽기
+        obs = self.get_observation()
+        joint_names = [
+            "shoulder_pan", "shoulder_lift", "elbow_flex",
+            "wrist_flex", "wrist_roll", "gripper",
+        ]
+ 
+        current = {}
+        for name in joint_names:
+            key = f"{name}.pos"
+            if key in obs:
+                current[key] = float(obs[key])
+ 
+        # 선형 보간으로 부드럽게 이동
+        total_steps = int(duration * fps)
+        interval = 1.0 / fps
+ 
+        print(f"[{self.id}] 홈 포지션으로 이동 중... ({duration}초)")
+ 
+        for step in range(1, total_steps + 1):
+            t = step / total_steps  # 0→1 진행률
+ 
+            # ease-in-out 보간 (더 부드러운 움직임)
+            t_smooth = t * t * (3.0 - 2.0 * t)
+ 
+            action = {}
+            for key in current:
+                if key in self.home_position:
+                    start = current[key]
+                    end = self.home_position[key]
+                    action[key] = start + (end - start) * t_smooth
+ 
+            self.send_action(action)
+            time.sleep(interval)
+ 
+        print(f"[{self.id}] 홈 포지션 도착!")        
+
     # ── 관측/제어 ──
 
     def get_observation(self):
@@ -396,3 +511,10 @@ class SO101(NexodimRobot):
             print(f"[{self.id}] Main Robot 해제 완료")
         self.disconnect_leader()
         self.disconnect_camera()
+
+    def safe_disconnect(self, duration=3.0):
+        """홈 포지션으로 이동 후 안전하게 연결 해제합니다."""
+        if self.home_position is not None and self.robot is not None:
+            print(f"[{self.id}] 안전 종료: 홈 포지션으로 이동 중...")
+            self.go_home(duration=duration)
+        self.disconnect()
