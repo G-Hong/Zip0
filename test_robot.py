@@ -104,7 +104,7 @@ def step2_record(task="pick up the cup", episodes=10):
 #  3단계: 학습
 # ══════════════════════════════════════════════════════
 
-def step3_train(dataset_repo_id, steps=20000, batch_size=64):
+def step3_train(dataset_repo_id = '/home/nyoung/dev/NxD/Zip0/data/lerobot_dataset/pick_up_the_cup', steps=20000, batch_size=64):
     """SmolVLA 모델을 파인튜닝합니다."""
     print("\n" + "=" * 50)
     print("  3단계: SmolVLA 파인튜닝")

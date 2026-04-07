@@ -206,6 +206,10 @@ class SmolVLA(NexodimPolicies):
             key: ft for key, ft in features.items() if key not in output_features
         }
 
+        # 기존 모델의 설정(카메라 2개 등)을 내 데이터셋(카메라 1개)에 맞게 강제 업데이트!
+        self.config.input_features = input_features
+        self.config.output_features = output_features
+
         # 프리프로세서 업데이트 (데이터셋 통계 기반 정규화)
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.config,

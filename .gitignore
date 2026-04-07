@@ -10,3 +10,4 @@ venv/
 *.png
 src/
 data/
+outputs/
