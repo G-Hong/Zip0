@@ -27,7 +27,7 @@ class SO101(NexodimRobot):
         self.leader_port = None
         self.home_position = None
 
-    # ── 내부 유틸 ──
+    # ── 내부 유틸 ── 현재까지는 Lerobot 설명 코드랑 같음. 추후 포트가 ttyACM*형태가 아닐 수 있으니 이 부분 수정
 
     def _find_port(self, name):
         input(f"[{self.id}] {name} USB를 제거해주세요. 제거 후 엔터")
